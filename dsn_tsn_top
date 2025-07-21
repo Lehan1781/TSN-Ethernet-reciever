@@ -1,0 +1,147 @@
+module dpram_tsn_top(
+    input wire clk,
+    input wire rst_n,
+
+    input wire wr_en,
+    input wire [7:0] wr_data,
+    output reg dpram_full,
+
+    input wire rd_en,
+    output reg [7:0] rd_data,
+    output reg frame_ready,
+    output reg is_tsn_frame,
+
+    output wire [2:0] pcp_out,
+    output reg [2:0] tsn_protocol_type,
+    output wire [7:0] buf0, buf1, buf2, buf3, buf4, buf5, buf6, buf7
+);
+
+    parameter DEPTH = 256;
+    parameter FRAME_SIZE = 16;
+    parameter ADDR_WIDTH = 8;
+
+    reg [7:0] dpram [0:DEPTH-1];
+
+    reg [ADDR_WIDTH-1:0] wr_ptr;
+    reg [ADDR_WIDTH-1:0] rd_ptr;
+    reg [ADDR_WIDTH-1:0] rd_base_ptr;
+
+    reg [3:0] byte_count;
+    reg [7:0] ethertype_high, ethertype_low;
+    reg [2:0] pcp_bits;
+    reg [7:0] payload_byte;
+
+    reg [7:0] pcp_buffers [0:7];
+
+    reg analyzing;
+    reg check_tsn;
+    reg wait_for_check;
+
+    assign pcp_out = pcp_bits;
+    assign buf0 = pcp_buffers[0];
+    assign buf1 = pcp_buffers[1];
+    assign buf2 = pcp_buffers[2];
+    assign buf3 = pcp_buffers[3];
+    assign buf4 = pcp_buffers[4];
+    assign buf5 = pcp_buffers[5];
+    assign buf6 = pcp_buffers[6];
+    assign buf7 = pcp_buffers[7];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wr_ptr <= 0;
+            rd_ptr <= 0;
+            rd_base_ptr <= 0;
+            dpram_full <= 0;
+            frame_ready <= 0;
+            is_tsn_frame <= 0;
+            tsn_protocol_type <= 0;
+            analyzing <= 0;
+            byte_count <= 0;
+            check_tsn <= 0;
+            wait_for_check <= 0;
+            pcp_bits <= 0;
+            payload_byte <= 0;
+        end else begin
+            // Write logic
+            if (wr_en && !dpram_full) begin
+                dpram[wr_ptr] <= wr_data;
+                wr_ptr <= wr_ptr + 1;
+                byte_count <= byte_count + 1;
+
+                if (byte_count == FRAME_SIZE - 1) begin
+                    dpram_full <= 1;
+                    frame_ready <= 1;
+                    analyzing <= 1;
+                    rd_base_ptr <= wr_ptr - (FRAME_SIZE - 1);
+                    rd_ptr <= wr_ptr - (FRAME_SIZE - 1);
+                    byte_count <= 0;
+                end
+            end
+
+            // Reading logic
+            if (rd_en && analyzing) begin
+                rd_data <= dpram[rd_ptr];
+
+                if ((rd_ptr - rd_base_ptr) == 12)
+                    ethertype_high <= dpram[rd_ptr];
+                if ((rd_ptr - rd_base_ptr) == 13)
+                    ethertype_low <= dpram[rd_ptr];
+                if ((rd_ptr - rd_base_ptr) == 14)
+                    pcp_bits <= dpram[rd_ptr][7:5];
+                if ((rd_ptr - rd_base_ptr) == 15)
+                    payload_byte <= dpram[rd_ptr];
+
+                if ((rd_ptr - rd_base_ptr) == 15)
+                    wait_for_check <= 1; // Delay TSN check by 1 cycle
+
+                rd_ptr <= rd_ptr + 1;
+            end
+
+            // Wait one cycle after last byte to check TSN
+            if (wait_for_check) begin
+                wait_for_check <= 0;
+                check_tsn <= 1;
+            end
+
+            // Check Ethertype and classify/store TSN frame
+            if (check_tsn) begin
+                case ({ethertype_high, ethertype_low})
+                    16'h22F0: begin
+                        is_tsn_frame <= 1;
+                        tsn_protocol_type <= 3'd1; // TSN Control
+                    end
+                    16'h88F7: begin
+                        is_tsn_frame <= 1;
+                        tsn_protocol_type <= 3'd2; // PTP
+                    end
+                    16'h8100: begin
+                        is_tsn_frame <= 1;
+                        tsn_protocol_type <= 3'd3; // VLAN
+                    end
+                    16'h86DD: begin
+                        is_tsn_frame <= 1;
+                        tsn_protocol_type <= 3'd4; // IPv6
+                    end
+                    default: begin
+                        is_tsn_frame <= 0;
+                        tsn_protocol_type <= 3'd0; // Not TSN
+                    end
+                endcase
+
+                // Only store payload if TSN frame
+                if (({ethertype_high, ethertype_low} == 16'h22F0) ||
+                    ({ethertype_high, ethertype_low} == 16'h88F7) ||
+                    ({ethertype_high, ethertype_low} == 16'h8100) ||
+                    ({ethertype_high, ethertype_low} == 16'h86DD)) begin
+
+                    pcp_buffers[pcp_bits] <= payload_byte;
+                end
+
+                dpram_full <= 0;
+                frame_ready <= 0;
+                analyzing <= 0;
+                check_tsn <= 0;
+            end
+        end
+    end
